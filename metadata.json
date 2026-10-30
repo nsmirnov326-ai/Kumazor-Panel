@@ -1,0 +1,6 @@
+{
+  "name": "KUMAZOR — Мониторинг медиаполя и алертов",
+  "description": "Система мониторинга Telegram, ВКонтакте, Одноклассников и СМИ с поиском уровня TGStat, многопользовательскими кабинетами и интеграцией Telegram бота.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

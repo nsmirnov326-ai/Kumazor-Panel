@@ -1,0 +1,800 @@
+вот история чата и код:
+Чтобы ты знал замыслы гемини
+
+
+
+Model 4:57 PM
+Thoughts
+
+
+
+
+
+
+
+
+
+
+Expand to view model thoughts
+chevron_right
+Принято, подход абсолютно верный. Если разворачивать на собственном сервере как полноценный независимый веб-сервис (веб-панель), снимаются любые ограничения мобильных/клиентских интерфейсов: доступен весь экран монитора, быстрые горячие клавиши, тяжелые таблицы с сортировкой сотен строк, экспорт и сложный поиск.
+В такой схеме Telegram используется только как транспорт для сбора сырых данных, а работать вы будете в браузере через полноценный рабочий интерфейс.
+Ниже готовая рабочая архитектура, логика парсера и структура сервиса, которую можно развернуть у себя через Docker.
+1. Архитектура сервиса
+Сервис состоит из 4 модулей, упакованных в docker-compose:
+codeText
+```
+[Telegram / Brand Analytics]
+          │
+          ▼
+   ┌──────────────┐
+   │  TG Worker   │ ──(перехватывает алерты, парсит ссылки)
+   └──────┬───────┘
+          │
+          ▼
+   ┌──────────────┐
+   │ Text Scraper │ ──(ходит по ссылке, забирает 100% текста)
+   └──────┬───────┘
+          │
+          ▼
+   ┌──────────────┐      ┌────────────────────────┐
+   │  PostgreSQL  │ ◄──► │ Backend API (FastAPI)  │
+   │ (полнотекст) │      └───────────┬────────────┘
+   └──────────────┘                  │
+                                     ▼
+                         ┌────────────────────────┐
+                         │ Веб-панель (Dashboard) │
+                         │ [ Лента ] | [ Таблица ]│
+                         └────────────────────────┘
+```
+2. Сбор и дозабор полного текста (Логика парсера)
+Сообщения от Brand Analytics содержат обрезанный текст и гиперссылки.
+1. Извлечение метаданных: Регулярными выражениями и через сущности Telegram (entities):
+  * Фильтр: "Смирнов"
+  * Соцсеть: telegram.org
+  * Название канала: Ivan Davydov
+  * Ссылка на канал: https://telegram.me/ivanfdavydov
+  * Аудитория: 10947 (число)
+  * Дата/время: 27.10.2026 13:25 (приводится к единому таймстемпу)
+  * Ссылка на пост: https://telegram.me/ivanfdavydov/4190
+2. Забор полного текста по ссылке:
+Если ссылка ведет на Telegram (t.me/... или telegram.me/...), серверу не нужен headless-браузер. Достаточно сделать простой HTTP-запрос к публичному embed-виджету:
+https://t.me/ivanfdavydov/4190?embed=1
+  В ответе HTML-блок с классом .tgme_widget_message_text содержит полный неотсеченный текст поста. Скрипт забирает его за 50–100 миллисекунд и записывает в БД в поле full_text.
+3. Структура базы данных (PostgreSQL)
+Для поиска уровня TGStat (с поддержкой морфологии, фраз и исключений) в PostgreSQL настраивается русский словарь полнотекстового поиска (russian FTS):
+codeSQL
+```
+CREATE TABLE publications (
+    id SERIAL PRIMARY KEY,
+    filter_name VARCHAR(255),
+    network VARCHAR(100),
+    author_name VARCHAR(255),
+    author_url TEXT,
+    post_url TEXT UNIQUE,
+    audience INTEGER,
+    published_at TIMESTAMP WITH TIME ZONE,
+    raw_snippet TEXT,
+    full_text TEXT,
+    tsv_content tsvector  -- вектор для мгновенного поиска по тексту
+);
+
+-- Индекс для полнотекстового поиска
+CREATE INDEX idx_fts_content ON publications USING gin(tsv_content);
+
+-- Индексы для фильтров
+CREATE INDEX idx_pub_date ON publications(published_at DESC);
+CREATE INDEX idx_pub_author ON publications(author_name);
+CREATE INDEX idx_pub_audience ON publications(audience);
+```
+4. Веб-интерфейс: два режима и фильтры
+Интерфейс панели строится на базе чистого SPA (например, React + Tailwind или даже легковесный вариант на чистом JS + Tabulator/DataTables).
+Верхняя панель управления (Фильтры в стиле TGStat)
+* Поисковая строка: поддерживает операторы:
+  * слово1 слово2 — логическое "И";
+  * "точная фраза" — поиск строгого вхождения;
+  * слово1 | слово2 — логическое "ИЛИ";
+  * слово1 -слово2 — исключение слова.
+* Период: DateRangePicker (выбор дат от / до или кнопки «1ч», «24ч», «7 дней»).
+* Автор / Канал: выпадающий список с автодополнением (берется динамически из БД).
+* Аудитория: ползунок или поля от и до.
+* Переключатель вида: две крупные кнопки [ 📰 Лента ] и [ 📊 Таблица ].
+* Кнопка «Экспорт в XLSX»: скачивает в Excel ровно то, что сейчас отфильтровано на экране.
+Режим 1: «Лента» (Feed View)
+Оптимален для вычитки материалов по конкретному автору или теме.
+* Вертикальный поток карточек.
+* В шапке карточки: логотип сети, кликабельное имя автора, бейдж охвата (👥 11.9k), дата публикации в удобном формате (относительном: "15 мин назад" и абсолютном).
+* Тело: полный отформатированный текст. Если текст больше 1000 знаков, можно оставлять кнопку «Развернуть», но по умолчанию показывать его читаемым блоком.
+* Подвал карточки: ссылка "Перейти к оригиналу", кнопка скопировать текст, бейдж фильтра Brand Analytics.
+Режим 2: «Таблица» (Table View)
+Оптимален для мониторинга объемов, выгрузки и сортировки.
+* Сетка данных:
+  * Дата / Время (сортируемая колонка)
+  * Сеть
+  * Канал / Автор (ссылка)
+  * Аудитория (числом, сортировка от максимума к минимуму)
+  * Фрагмент текста (с подсветкой найденных ключевых слов)
+  * Действия (кнопка развернуть полный текст в боковой шторке, открыть оригинал)
+* Клик по строке открывает справа шторку (drawer) с полным текстом поста без перехода на другие страницы.
+5. С чего начать развертывание
+Чтобы собрать под вас минимальный рабочий прототип:
+1. Как забирать алерты из Telegram:
+Сообщения от Brand Analytics падают в группу/канал (тогда проще использовать Telegram Bot API) или в личку аккаунта (тогда нужен скрипт на базе библиотеки Telethon/Pyrogram)?
+2. Нужна ли авторизация в панели? (Базовый логин/пароль на входе в веб-интерфейс, чтобы панель не торчала наружу в открытом виде).
+Если уточните этот момент, я сформирую готовый код для бекенда-парсера и Docker-конфигурацию для запуска на вашем сервере.
+Model 4:58 PM
+Thoughts
+
+
+
+
+
+
+
+
+
+
+
+Expand to view model thoughts
+chevron_right
+Ниже представлена полная рабочая кодовая база проекта, готовая к развертыванию на вашем Linux/VPS сервере в одну команду через Docker.
+Архитектура сделана максимально легкой и надежной:
+* Бекенд: Python (FastAPI + Aiogram 3 для приема сообщений из Telegram + BeautifulSoup для скрейпинга полного текста).
+* База данных: PostgreSQL 16 с полнотекстовым поиском.
+* Фронтенд: Быстрый Single-Page Application (SPA) с переключением «Лента» / «Таблица», фильтрами в стиле TGStat и выгрузкой в Excel. Никаких тяжелых node_modules — всё отрисовывается на лету.
+Структура файлов проекта
+Создайте на сервере папку ba-monitor со следующей структурой:
+codeText
+```
+ba-monitor/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── app/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── database.py
+│   ├── parser.py
+│   ├── scraper.py
+│   ├── bot.py
+│   └── main.py
+└── static/
+    └── index.html
+```
+1. docker-compose.yml
+codeYaml
+```
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ba_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ba_monitor
+      POSTGRES_USER: ba_user
+      POSTGRES_PASSWORD: ba_secret_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ba_user -d ba_monitor"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: ba_app
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ba_user:ba_secret_password@db:5432/ba_monitor
+      BOT_TOKEN: "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # Токен вашего бота от @BotFather
+      ALLOWED_CHAT_IDS: ""                      # ID чата/группы через запятую (если пусто — принимает от всех)
+
+volumes:
+  pgdata:
+```
+2. requirements.txt
+codeText
+```
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+sqlalchemy[asyncio]>=2.0.28
+asyncpg>=0.29.0
+aiogram>=3.4.1
+httpx>=0.27.0
+beautifulsoup4>=4.12.3
+pandas>=2.2.1
+openpyxl>=3.1.2
+python-multipart>=0.0.9
+```
+3. Dockerfile
+codeDockerfile
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8080
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+4. app/config.py
+codePython
+```
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://ba_user:ba_secret_password@localhost:5432/ba_monitor")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ALLOWED_CHAT_IDS = [int(i.strip()) for i in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if i.strip()]
+```
+5. app/database.py
+codePython
+```
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import Text, Integer, DateTime, func, Index
+from datetime import datetime
+from app.config import DATABASE_URL
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+class Base(DeclarativeBase):
+    pass
+
+class Publication(Base):
+    __tablename__ = "publications"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    filter_name: Mapped[str] = mapped_column(Text, index=True)
+    network: Mapped[str] = mapped_column(Text)
+    author_name: Mapped[str] = mapped_column(Text, index=True)
+    author_url: Mapped[str] = mapped_column(Text)
+    post_url: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    audience: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    snippet_text: Mapped[str] = mapped_column(Text)
+    full_text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+```
+6. app/scraper.py (Забор полного текста)
+codePython
+```
+import httpx
+from bs4 import BeautifulSoup
+
+async def fetch_full_text(url: str, fallback_snippet: str) -> str:
+    """
+    Скачивает 100% текста публикации через публичный embed Telegram,
+    минуя блокировки и ограничения.
+    """
+    if "t.me/" not in url and "telegram.me/" not in url:
+        return fallback_snippet
+
+    embed_url = url.replace("telegram.me/", "t.me/")
+    if not embed_url.endswith("?embed=1"):
+        embed_url += "?embed=1"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
+            resp = await client.get(embed_url, headers=headers)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                text_div = soup.find("div", class_="tgme_widget_message_text")
+                if text_div:
+                    for br in text_div.find_all("br"):
+                        br.replace_with("\n")
+                    text = text_div.get_text().strip()
+                    if len(text) > len(fallback_snippet.replace("...", "")):
+                        return text
+    except Exception as e:
+        print(f"[Scraper Error] {url}: {e}")
+
+    return fallback_snippet
+```
+7. app/parser.py (Разбор формата Brand Analytics)
+codePython
+```
+import re
+from datetime import datetime
+
+def parse_ba_message(text: str, entities: list = None) -> dict:
+    """
+    Парсит структуру типового сообщения Brand Analytics,
+    извлекая все параметры, включая ссылки из markdown/entities.
+    """
+    data = {
+        "filter_name": "Общий",
+        "audience": 0,
+        "network": "telegram.org",
+        "post_url": "",
+        "published_at": datetime.utcnow(),
+        "author_name": "Неизвестный автор",
+        "author_url": "",
+        "snippet_text": ""
+    }
+
+    # 1. Фильтр и аудитория в шапке
+    filt_m = re.search(r'персонального фильтра\s*["«]([^"»]+)["»]', text)
+    if filt_m:
+        data["filter_name"] = filt_m.group(1).strip()
+
+    aud_m = re.search(r'(?:аудиторией|👥)\s*([\d\s]+)', text)
+    if aud_m:
+        data["audience"] = int(re.sub(r'\s+', '', aud_m.group(1)))
+
+    # 2. Сеть, пост URL и дата
+    # Пример: Пост в telegram.org (https://telegram.me/UstKutNet/28837) | 27.10.2026  13:24 (UTC+3)
+    post_m = re.search(r'Пост в\s+([^\s\(]+)\s*\((https?://[^\)]+)\)\s*\|\s*([\d\.\s\:]+)', text)
+    if post_m:
+        data["network"] = post_m.group(1).strip()
+        data["post_url"] = post_m.group(2).strip()
+        raw_dt = post_m.group(3).strip()
+        try:
+            # Очистка двойных пробелов между датой и временем
+            raw_dt = re.sub(r'\s+', ' ', raw_dt)
+            data["published_at"] = datetime.strptime(raw_dt, "%d.%m.%Y %H:%M")
+        except Exception:
+            data["published_at"] = datetime.utcnow()
+
+    # 3. Автор и ссылка на канал
+    # Пример: Усть-Кут24 (https://telegram.me/UstKutNet) 👥 11 920
+    auth_m = re.search(r'\n([^\n\(]+)\s*\((https?://[^\)]+)\)\s*👥', text)
+    if auth_m:
+        data["author_name"] = auth_m.group(1).strip()
+        data["author_url"] = auth_m.group(2).strip()
+
+    # 4. Текст поста (все после строки с автором и аудиторией)
+    lines = text.split("\n")
+    start_body = False
+    body_lines = []
+    for line in lines:
+        if start_body:
+            body_lines.append(line)
+        elif "👥" in line:
+            start_body = True
+
+    data["snippet_text"] = "\n".join(body_lines).strip()
+    return data
+```
+8. app/bot.py (Telegram Listener)
+codePython
+```
+import asyncio
+from aiogram import Bot, Dispatcher, types
+from app.config import BOT_TOKEN, ALLOWED_CHAT_IDS
+from app.parser import parse_ba_message
+from app.scraper import fetch_full_text
+from app.database import AsyncSessionLocal, Publication
+from sqlalchemy import select
+
+bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+dp = Dispatcher()
+
+@dp.message()
+async def handle_incoming(message: types.Message):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+
+    text = message.text or message.caption or ""
+    if "Brand Analytics" not in text and "персонального фильтра" not in text:
+        return
+
+    # Извлечение скрытых ссылок из Entities Telegram
+    parsed = parse_ba_message(text)
+    if not parsed["post_url"]:
+        # Fallback на entities если ссылки были скрыты
+        if message.entities:
+            for ent in message.entities:
+                if ent.type == "text_link" and ent.url:
+                    if "/t.me/" in ent.url or "telegram.me/" in ent.url:
+                        if not parsed["post_url"]:
+                            parsed["post_url"] = ent.url
+
+    if not parsed["post_url"]:
+        return
+
+    # Забор полного текста
+    full_text = await fetch_full_text(parsed["post_url"], parsed["snippet_text"])
+
+    async with AsyncSessionLocal() as session:
+        # Проверка на дубликаты
+        exist = await session.execute(select(Publication).where(Publication.post_url == parsed["post_url"]))
+        if exist.scalar_one_or_none():
+            return
+
+        pub = Publication(
+            filter_name=parsed["filter_name"],
+            network=parsed["network"],
+            author_name=parsed["author_name"],
+            author_url=parsed["author_url"],
+            post_url=parsed["post_url"],
+            audience=parsed["audience"],
+            published_at=parsed["published_at"],
+            snippet_text=parsed["snippet_text"],
+            full_text=full_text
+        )
+        session.add(pub)
+        await session.commit()
+```
+9. app/main.py (FastAPI Server + API + Excel)
+codePython
+```
+import asyncio
+from fastapi import FastAPI, Depends, Query, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc, or_, and_
+from contextlib import asynccontextmanager
+import pandas as pd
+import io
+
+from app.database import init_db, AsyncSessionLocal, Publication
+from app.bot import bot, dp
+from app.config import BOT_TOKEN
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    bot_task = None
+    if bot:
+        bot_task = asyncio.create_task(dp.start_polling(bot))
+    yield
+    if bot_task:
+        bot_task.cancel()
+
+app = FastAPI(title="Brand Analytics Dashboard", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+@app.get("/")
+def read_index():
+    return FileResponse("static/index.html")
+
+@app.get("/api/posts")
+async def get_posts(
+    q: str = Query(None),
+    author: str = Query(None),
+    filter_name: str = Query(None),
+    min_aud: int = Query(None),
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db)
+):
+    stmt = select(Publication).order_by(desc(Publication.published_at))
+    conditions = []
+
+    if q:
+        words = q.strip().split()
+        for w in words:
+            if w.startswith("-") and len(w) > 1:
+                conditions.append(~Publication.full_text.ilike(f"%{w[1:]}%"))
+            else:
+                conditions.append(Publication.full_text.ilike(f"%{w}%"))
+    if author:
+        conditions.append(Publication.author_name == author)
+    if filter_name:
+        conditions.append(Publication.filter_name == filter_name)
+    if min_aud:
+        conditions.append(Publication.audience >= min_aud)
+
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
+
+    result = await db.execute(stmt.limit(limit).offset(offset))
+    items = result.scalars().all()
+    return items
+
+@app.get("/api/filters-meta")
+async def get_filters_meta(db: AsyncSession = Depends(get_db)):
+    authors = await db.execute(select(Publication.author_name).distinct())
+    filters = await db.execute(select(Publication.filter_name).distinct())
+    return {
+        "authors": [a[0] for a in authors.fetchall() if a[0]],
+        "filters": [f[0] for f in filters.fetchall() if f[0]]
+    }
+
+@app.get("/api/export")
+async def export_excel(q: str = None, author: str = None, db: AsyncSession = Depends(get_db)):
+    stmt = select(Publication).order_by(desc(Publication.published_at))
+    conditions = []
+    if q:
+        conditions.append(Publication.full_text.ilike(f"%{q}%"))
+    if author:
+        conditions.append(Publication.author_name == author)
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
+
+    result = await db.execute(stmt.limit(2000))
+    records = result.scalars().all()
+
+    df = pd.DataFrame([{
+        "Дата": r.published_at.strftime("%Y-%m-%d %H:%M"),
+        "Сеть": r.network,
+        "Автор": r.author_name,
+        "Аудитория": r.audience,
+        "Фильтр BA": r.filter_name,
+        "Ссылка на пост": r.post_url,
+        "Полный текст": r.full_text
+    } for r in records])
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Мониторинг")
+    output.seek(0)
+
+    headers = {"Content-Disposition": 'attachment; filename="monitoring_export.xlsx"'}
+    return Response(content=output.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+```
+10. static/index.html (Веб-панель: Лента + Таблица)
+codeHtml
+```
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <title>Brand Analytics Monitor Panel</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: 'class' }
+  </script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col font-sans">
+
+  <!-- Header -->
+  <header class="bg-gray-800 border-b border-gray-700 px-6 py-4 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-50">
+    <div class="flex items-center gap-3">
+      <i class="fa-solid fa-radar text-blue-500 text-2xl"></i>
+      <h1 class="text-xl font-bold tracking-tight">BA Dashboard</h1>
+    </div>
+
+    <!-- Toggle Modes -->
+    <div class="flex items-center bg-gray-900 p-1 rounded-lg border border-gray-700">
+      <button id="feedModeBtn" onclick="setMode('feed')" class="px-4 py-1.5 rounded-md text-sm font-medium bg-blue-600 text-white transition">
+        <i class="fa-solid fa-bars-staggered mr-2"></i>Лента
+      </button>
+      <button id="tableModeBtn" onclick="setMode('table')" class="px-4 py-1.5 rounded-md text-sm font-medium text-gray-400 hover:text-white transition">
+        <i class="fa-solid fa-table mr-2"></i>Таблица
+      </button>
+    </div>
+
+    <!-- Export Button -->
+    <button onclick="exportExcel()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition">
+      <i class="fa-solid fa-file-excel"></i> Экспорт в Excel
+    </button>
+  </header>
+
+  <!-- Filter Bar -->
+  <div class="bg-gray-800/60 backdrop-blur border-b border-gray-700/60 px-6 py-3 flex flex-wrap gap-3 items-center">
+    <div class="flex-1 min-w-[280px] relative">
+      <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-gray-400"></i>
+      <input type="text" id="searchInput" onkeydown="if(event.key==='Enter') loadData()" placeholder="Поиск (слова, фразы, -минус)..." 
+             class="w-full bg-gray-900 border border-gray-700 rounded-lg pl-10 pr-4 py-2 text-sm focus:outline-none focus:border-blue-500">
+    </div>
+
+    <select id="authorSelect" onchange="loadData()" class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none">
+      <option value="">Все авторы</option>
+    </select>
+
+    <select id="filterSelect" onchange="loadData()" class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none">
+      <option value="">Все фильтры BA</option>
+    </select>
+
+    <input type="number" id="minAudInput" onchange="loadData()" placeholder="Мин. аудитория" 
+           class="w-36 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none">
+
+    <button onclick="loadData()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-medium">Найти</button>
+  </div>
+
+  <!-- Content Container -->
+  <main class="flex-1 p-6 max-w-7xl w-full mx-auto">
+    <!-- FEED VIEW -->
+    <div id="feedView" class="space-y-4"></div>
+
+    <!-- TABLE VIEW -->
+    <div id="tableView" class="hidden overflow-x-auto bg-gray-800 border border-gray-700 rounded-xl">
+      <table class="w-full text-left text-sm">
+        <thead class="bg-gray-900/80 text-gray-400 border-b border-gray-700">
+          <tr>
+            <th class="p-3">Дата</th>
+            <th class="p-3">Автор</th>
+            <th class="p-3">Охват</th>
+            <th class="p-3">Текст (превью)</th>
+            <th class="p-3">Ссылка</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody" class="divide-y divide-gray-700/60"></tbody>
+      </table>
+    </div>
+  </main>
+
+  <!-- Modal for Full Text in Table Mode -->
+  <div id="textModal" class="fixed inset-0 bg-black/70 hidden items-center justify-center p-4 z-50">
+    <div class="bg-gray-800 border border-gray-700 rounded-xl max-w-2xl w-full p-6 space-y-4 max-h-[85vh] flex flex-col">
+      <div class="flex justify-between items-center border-b border-gray-700 pb-3">
+        <h3 id="modalTitle" class="font-bold text-lg text-blue-400"></h3>
+        <button onclick="closeModal()" class="text-gray-400 hover:text-white text-xl">&times;</button>
+      </div>
+      <div id="modalContent" class="overflow-y-auto whitespace-pre-wrap text-gray-200 text-sm leading-relaxed"></div>
+      <div class="text-right">
+        <a id="modalLink" target="_blank" class="text-blue-400 hover:underline text-sm font-medium">Перейти к оригиналу &rarr;</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentMode = 'feed';
+    let postsData = [];
+
+    function setMode(mode) {
+      currentMode = mode;
+      document.getElementById('feedView').classList.toggle('hidden', mode !== 'feed');
+      document.getElementById('tableView').classList.toggle('hidden', mode !== 'table');
+
+      document.getElementById('feedModeBtn').className = mode === 'feed' 
+        ? "px-4 py-1.5 rounded-md text-sm font-medium bg-blue-600 text-white transition"
+        : "px-4 py-1.5 rounded-md text-sm font-medium text-gray-400 hover:text-white transition";
+
+      document.getElementById('tableModeBtn').className = mode === 'table' 
+        ? "px-4 py-1.5 rounded-md text-sm font-medium bg-blue-600 text-white transition"
+        : "px-4 py-1.5 rounded-md text-sm font-medium text-gray-400 hover:text-white transition";
+
+      render();
+    }
+
+    async function loadMeta() {
+      const res = await fetch('/api/filters-meta');
+      const data = await res.json();
+      const aSel = document.getElementById('authorSelect');
+      const fSel = document.getElementById('filterSelect');
+      data.authors.forEach(a => aSel.innerHTML += `<option value="${a}">${a}</option>`);
+      data.filters.forEach(f => fSel.innerHTML += `<option value="${f}">${f}</option>`);
+    }
+
+    async function loadData() {
+      const q = document.getElementById('searchInput').value;
+      const author = document.getElementById('authorSelect').value;
+      const filter_name = document.getElementById('filterSelect').value;
+      const min_aud = document.getElementById('minAudInput').value;
+
+      const params = new URLSearchParams();
+      if(q) params.append('q', q);
+      if(author) params.append('author', author);
+      if(filter_name) params.append('filter_name', filter_name);
+      if(min_aud) params.append('min_aud', min_aud);
+
+      const res = await fetch('/api/posts?' + params.toString());
+      postsData = await res.json();
+      render();
+    }
+
+    function render() {
+      if(currentMode === 'feed') renderFeed();
+      else renderTable();
+    }
+
+    function renderFeed() {
+      const c = document.getElementById('feedView');
+      if(!postsData.length) {
+        c.innerHTML = '<div class="text-center py-12 text-gray-500">Нет публикаций по заданным критериям</div>';
+        return;
+      }
+      c.innerHTML = postsData.map(p => `
+        <article class="bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg space-y-3">
+          <div class="flex items-center justify-between flex-wrap gap-2 text-xs border-b border-gray-700/60 pb-3">
+            <div class="flex items-center gap-2">
+              <span class="bg-blue-900/60 text-blue-300 font-semibold px-2 py-0.5 rounded border border-blue-700/40">${p.network}</span>
+              <a href="${p.author_url}" target="_blank" class="font-bold text-gray-200 hover:text-blue-400 text-sm">${p.author_name}</a>
+              <span class="text-gray-400">👥 ${Number(p.audience).toLocaleString('ru-RU')}</span>
+            </div>
+            <div class="text-gray-400 flex items-center gap-3">
+              <span>Фильтр: <b class="text-gray-300">${p.filter_name}</b></span>
+              <span>${new Date(p.published_at).toLocaleString('ru-RU')}</span>
+            </div>
+          </div>
+          <div class="text-gray-200 text-sm whitespace-pre-wrap leading-relaxed">${p.full_text}</div>
+          <div class="pt-2 text-right">
+            <a href="${p.post_url}" target="_blank" class="text-xs text-blue-400 hover:underline">Открыть публикацию &rarr;</a>
+          </div>
+        </article>
+      `).join('');
+    }
+
+    function renderTable() {
+      const b = document.getElementById('tableBody');
+      if(!postsData.length) {
+        b.innerHTML = '<tr><td colspan="5" class="text-center py-8 text-gray-500">Нет публикаций</td></tr>';
+        return;
+      }
+      b.innerHTML = postsData.map((p, idx) => `
+        <tr class="hover:bg-gray-700/40 transition">
+          <td class="p-3 text-xs text-gray-400 whitespace-nowrap">${new Date(p.published_at).toLocaleDateString('ru-RU')} ${new Date(p.published_at).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'})}</td>
+          <td class="p-3 font-medium text-gray-200">${p.author_name}</td>
+          <td class="p-3 text-xs text-gray-300 whitespace-nowrap">👥 ${Number(p.audience).toLocaleString('ru-RU')}</td>
+          <td class="p-3 text-xs text-gray-400 max-w-md truncate cursor-pointer hover:text-blue-300" onclick="openModal(${idx})">
+            ${p.full_text.substring(0, 140)}...
+          </td>
+          <td class="p-3 text-xs whitespace-nowrap">
+            <a href="${p.post_url}" target="_blank" class="text-blue-400 hover:underline">Перейти</a>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function openModal(idx) {
+      const p = postsData[idx];
+      document.getElementById('modalTitle').innerText = `${p.author_name} (${p.network})`;
+      document.getElementById('modalContent').innerText = p.full_text;
+      document.getElementById('modalLink').href = p.post_url;
+      document.getElementById('textModal').classList.remove('hidden');
+      document.getElementById('textModal').classList.add('flex');
+    }
+
+    function closeModal() {
+      document.getElementById('textModal').classList.add('hidden');
+      document.getElementById('textModal').classList.remove('flex');
+    }
+
+    function exportExcel() {
+      const q = document.getElementById('searchInput').value;
+      const author = document.getElementById('authorSelect').value;
+      window.location.href = `/api/export?q=${encodeURIComponent(q)}&author=${encodeURIComponent(author)}`;
+    }
+
+    loadMeta();
+    loadData();
+  </script>
+</body>
+</html>
+```
+Где скачать и как развернуть (Инструкция)
+Шаг 1. Создайте файлы на вашем сервере
+Подключитесь к вашему VPS/серверу по SSH:
+codeBash
+```
+mkdir -p ba-monitor/app ba-monitor/static
+cd ba-monitor
+```
+Скопируйте код каждого файла в соответствующие пути (можно использовать редактор nano или скопировать папку через SFTP / FileZilla).
+Шаг 2. Настройте Telegram-бота
+1. Перейдите в Telegram к @BotFather и создайте бота (/newbot), получите токен.
+2. Откройте docker-compose.yml и вставьте ваш токен в переменную:
+  codeYaml
+  BOT_TOKEN: "123456789:ABCdefGhIJKlmNoPQRstuVWXyz"
+3. Добавьте бота в чат/группу, куда Brand Analytics присылает алерты (дайте боту права администратора на чтение сообщений).
+Шаг 3. Запуск
+В папке ba-monitor выполните:
+codeBash
+```
+docker compose up -d --build
+```
+Шаг 4. Готово!
+* Откройте браузер по адресу: http://IP_ВАШЕГО_СЕРВЕРА:8080.
+* По мере поступления алертов бот парсит их, выкачивает полные тексты постов и сразу наполняет базу данных. В веб-панели вам доступны оба режима («Лента» и «Таблица»), поиск и экспорт в Excel.
+Citations
+1. https://github.com/anubhav9369/portfolio

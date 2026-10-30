@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@layer base {
+  /* Default Kumazor Night Sky Palette */
+  :root,
+  .theme-kumazor {
+    --bg-page: #091424;
+    --bg-surface: #0f1f38;
+    --bg-surface-elevated: #15294a;
+    --border-color: #1e3963;
+    --text-primary: #edf2f7;
+    --text-secondary: #9cb1cc;
+    --accent-orange: #e85d26;
+    --accent-orange-hover: #ff733b;
+    --accent-blue: #4076b8;
+  }
+
+  .theme-black {
+    --bg-page: #0a0c10;
+    --bg-surface: #12151c;
+    --bg-surface-elevated: #191c26;
+    --border-color: #242938;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --accent-orange: #e85d26;
+    --accent-orange-hover: #ff733b;
+    --accent-blue: #3b82f6;
+  }
+
+  .theme-light {
+    --bg-page: #f4f6f9;
+    --bg-surface: #ffffff;
+    --bg-surface-elevated: #f8fafc;
+    --border-color: #e2e8f0;
+    --text-primary: #0f172a;
+    --text-secondary: #64748b;
+    --accent-orange: #d44a14;
+    --accent-orange-hover: #b83808;
+    --accent-blue: #2563eb;
+  }
+
+  body {
+    background-color: var(--bg-page);
+    color: var(--text-primary);
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+}
